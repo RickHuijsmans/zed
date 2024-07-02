@@ -2131,7 +2131,7 @@ impl Editor {
         self.refresh_inline_completion(false, cx);
     }
 
-    pub fn placeholder_text(&self, _cx: &mut WindowContext) -> Option<&str> {
+    pub fn placeholder_text(&self, _cx: &WindowContext) -> Option<&str> {
         self.placeholder_text.as_deref()
     }
 
@@ -2914,6 +2914,9 @@ impl Editor {
             let start_offset = TO::to_offset(&range.start, &buffer_snapshot);
             let end_offset = start_offset + end_difference;
             let start_offset = start_offset + start_difference;
+            if start_offset > buffer_snapshot.len() || end_offset > buffer_snapshot.len() {
+                continue;
+            }
             let start = buffer_snapshot.anchor_after(start_offset);
             let end = buffer_snapshot.anchor_after(end_offset);
             linked_edits
@@ -3120,14 +3123,24 @@ impl Editor {
             let anchor = snapshot.anchor_after(selection.end);
             if !self.linked_edit_ranges.is_empty() {
                 let start_anchor = snapshot.anchor_before(selection.start);
-                if let Some(ranges) =
-                    self.linked_editing_ranges_for(start_anchor.text_anchor..anchor.text_anchor, cx)
-                {
-                    for (buffer, edits) in ranges {
-                        linked_edits
-                            .entry(buffer.clone())
-                            .or_default()
-                            .extend(edits.into_iter().map(|range| (range, text.clone())));
+
+                let is_word_char = text.chars().next().map_or(true, |char| {
+                    let scope = snapshot.language_scope_at(start_anchor.to_offset(&snapshot));
+                    let kind = char_kind(&scope, char);
+
+                    kind == CharKind::Word
+                });
+
+                if is_word_char {
+                    if let Some(ranges) = self
+                        .linked_editing_ranges_for(start_anchor.text_anchor..anchor.text_anchor, cx)
+                    {
+                        for (buffer, edits) in ranges {
+                            linked_edits
+                                .entry(buffer.clone())
+                                .or_default()
+                                .extend(edits.into_iter().map(|range| (range, text.clone())));
+                        }
                     }
                 }
             }
@@ -6809,6 +6822,16 @@ impl Editor {
             return;
         }
 
+        if self
+            .context_menu
+            .write()
+            .as_mut()
+            .map(|menu| menu.select_first(self.project.as_ref(), cx))
+            .unwrap_or(false)
+        {
+            return;
+        }
+
         if matches!(self.mode, EditorMode::SingleLine { .. }) {
             cx.propagate();
             return;
@@ -8456,13 +8479,14 @@ impl Editor {
         runnable: &mut Runnable,
         cx: &WindowContext<'_>,
     ) -> Vec<(TaskSourceKind, TaskTemplate)> {
-        let (inventory, worktree_id) = project.read_with(cx, |project, cx| {
-            let worktree_id = project
+        let (inventory, worktree_id, file) = project.read_with(cx, |project, cx| {
+            let (worktree_id, file) = project
                 .buffer_for_id(runnable.buffer)
                 .and_then(|buffer| buffer.read(cx).file())
-                .map(|file| WorktreeId::from_usize(file.worktree_id()));
+                .map(|file| (WorktreeId::from_usize(file.worktree_id()), file.clone()))
+                .unzip();
 
-            (project.task_inventory().clone(), worktree_id)
+            (project.task_inventory().clone(), worktree_id, file)
         });
 
         let inventory = inventory.read(cx);
@@ -8472,7 +8496,12 @@ impl Editor {
             .flat_map(|tag| {
                 let tag = tag.0.clone();
                 inventory
-                    .list_tasks(Some(runnable.language.clone()), worktree_id)
+                    .list_tasks(
+                        file.clone(),
+                        Some(runnable.language.clone()),
+                        worktree_id,
+                        cx,
+                    )
                     .into_iter()
                     .filter(move |(_, template)| {
                         template.tags.iter().any(|source_tag| source_tag == &tag)
@@ -8813,13 +8842,7 @@ impl Editor {
         let display_point = initial_point.to_display_point(snapshot);
         let mut hunks = hunks
             .map(|hunk| diff_hunk_to_display(&hunk, &snapshot))
-            .filter(|hunk| {
-                if is_wrapped {
-                    true
-                } else {
-                    !hunk.contains_display_row(display_point.row())
-                }
-            })
+            .filter(|hunk| is_wrapped || !hunk.contains_display_row(display_point.row()))
             .dedup();
 
         if let Some(hunk) = hunks.next() {
@@ -12518,7 +12541,7 @@ pub fn diagnostic_block_renderer(diagnostic: Diagnostic, _is_valid: bool) -> Ren
         let group_id: SharedString = cx.block_id.to_string().into();
 
         let mut text_style = cx.text_style().clone();
-        text_style.color = diagnostic_style(diagnostic.severity, true, cx.theme().status());
+        text_style.color = diagnostic_style(diagnostic.severity, cx.theme().status());
         let theme_settings = ThemeSettings::get_global(cx);
         text_style.font_family = theme_settings.buffer_font.family.clone();
         text_style.font_style = theme_settings.buffer_font.style;
@@ -12614,25 +12637,19 @@ pub fn highlight_diagnostic_message(diagnostic: &Diagnostic) -> (SharedString, V
         prev_offset = ix + 1;
         if in_code_block {
             code_ranges.push(prev_len..text_without_backticks.len());
-            in_code_block = false;
-        } else {
-            in_code_block = true;
         }
+        in_code_block = !in_code_block;
     }
 
     (text_without_backticks.into(), code_ranges)
 }
 
-fn diagnostic_style(severity: DiagnosticSeverity, valid: bool, colors: &StatusColors) -> Hsla {
-    match (severity, valid) {
-        (DiagnosticSeverity::ERROR, true) => colors.error,
-        (DiagnosticSeverity::ERROR, false) => colors.error,
-        (DiagnosticSeverity::WARNING, true) => colors.warning,
-        (DiagnosticSeverity::WARNING, false) => colors.warning,
-        (DiagnosticSeverity::INFORMATION, true) => colors.info,
-        (DiagnosticSeverity::INFORMATION, false) => colors.info,
-        (DiagnosticSeverity::HINT, true) => colors.info,
-        (DiagnosticSeverity::HINT, false) => colors.info,
+fn diagnostic_style(severity: DiagnosticSeverity, colors: &StatusColors) -> Hsla {
+    match severity {
+        DiagnosticSeverity::ERROR => colors.error,
+        DiagnosticSeverity::WARNING => colors.warning,
+        DiagnosticSeverity::INFORMATION => colors.info,
+        DiagnosticSeverity::HINT => colors.info,
         _ => colors.ignored,
     }
 }
